@@ -1,4 +1,4 @@
-# BilibiliX
+# fuckyoupilipala
 
 个人用 B 站界面重设计脚本（Firefox + Violentmonkey），当前版本 **1.1.3**。
 
