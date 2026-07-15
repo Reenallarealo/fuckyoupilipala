@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliX
 // @namespace    https://github.com/local/bilibiliX
-// @version      1.1.0
+// @version      1.1.3
 // @description  个人用 B 站：首页重设计 + 搜索页精简 + 视频页宽屏暗色 + 匿名模式（阻断观看上报）
 // @author       you
 // @match        *://www.bilibili.com/*
@@ -105,10 +105,11 @@ html.${NS}-search .mini-header {
   const CONFIG = {
     homeBarH: 72,
     homeSearchH: 48,
-    watchDebounce: 250,
-    watchRetries: [400, 1200, 3000],
-    dmRetries: [500, 1500, 3000],
-    spaPollMs: 2500,
+    watchDebounce: 320,
+    watchRetries: [500, 2000],
+    dmRetries: [600, 2000],
+    commentRetries: [800, 2500],
+    spaPollMs: 4000,
     bootFailsafeMs: 2500,
     anonStorageKey: `${NS}-anon-mode`,
     /** 匿名模式：只拦「写历史 / 写进度 / 推荐反馈」，不拦 view/playurl/reply */
@@ -148,6 +149,22 @@ html.${NS}-search .mini-header {
     playerRO: null,
     watchers: new Map(),
     anonHooked: false,
+    spaHooked: false,
+    spaPollTimer: 0,
+    waiters: new Set(),
+    videoGen: 0,
+    dynGen: 0,
+    lastRouteKey: "",
+    styleReady: false,
+    placeholderObs: [],
+    prevColorScheme: "",
+    dynScrollTick: 0,
+    searchHostEl: null,
+    searchBackdropEl: null,
+    searchHintEl: null,
+    lastScrollVisualKey: -1,
+    spaTick: null,
+    patchedShadows: new WeakSet(),
   };
 
   // ---------------------------------------------------------------------------
@@ -192,18 +209,12 @@ html.${NS}-search .mini-header {
   function isAnonBlockedUrl(url) {
     if (!STATE.anonMode || !url) return false;
     let path = "";
-    let href = "";
     try {
-      const u = new URL(url, location.href);
-      path = u.pathname || "";
-      href = u.href;
+      path = new URL(url, location.href).pathname || "";
     } catch (_) {
-      href = String(url);
-      path = href;
+      path = String(url);
     }
-    return CONFIG.anonBlockPaths.some(
-      (rule) => path.includes(rule) || href.includes(rule)
-    );
+    return CONFIG.anonBlockPaths.some((rule) => path.includes(rule));
   }
 
   function fakeAnonResponse() {
@@ -221,9 +232,12 @@ html.${NS}-search .mini-header {
     const rawFetch = window.fetch;
     if (typeof rawFetch === "function") {
       window.fetch = function bxAnonFetch(input, init) {
-        const url = resolveRequestUrl(input);
-        if (isAnonBlockedUrl(url)) {
-          return Promise.resolve(fakeAnonResponse());
+        // 关闭匿名时几乎零开销：不做 URL 解析
+        if (STATE.anonMode) {
+          const url = resolveRequestUrl(input);
+          if (isAnonBlockedUrl(url)) {
+            return Promise.resolve(fakeAnonResponse());
+          }
         }
         return rawFetch.apply(this, arguments);
       };
@@ -233,15 +247,19 @@ html.${NS}-search .mini-header {
     const rawOpen = xhrProto.open;
     const rawSend = xhrProto.send;
     xhrProto.open = function bxAnonXhrOpen(method, url) {
-      try {
-        this[`${NS}AnonUrl`] = resolveRequestUrl(url);
-      } catch (_) {
-        this[`${NS}AnonUrl`] = String(url || "");
+      if (STATE.anonMode) {
+        try {
+          this[`${NS}AnonUrl`] = resolveRequestUrl(url);
+        } catch (_) {
+          this[`${NS}AnonUrl`] = String(url || "");
+        }
+      } else {
+        this[`${NS}AnonUrl`] = "";
       }
       return rawOpen.apply(this, arguments);
     };
     xhrProto.send = function bxAnonXhrSend(body) {
-      if (!isAnonBlockedUrl(this[`${NS}AnonUrl`])) {
+      if (!STATE.anonMode || !isAnonBlockedUrl(this[`${NS}AnonUrl`])) {
         return rawSend.apply(this, arguments);
       }
       const xhr = this;
@@ -324,17 +342,10 @@ html.${NS}-search .mini-header {
   installAnonNetworkHooks();
   registerAnonMenu();
 
-  /** 仅对评论相关自定义元素强制 open shadow，避免影响全站 */
-  const COMMENT_SHADOW_HOST_RE =
-    /^(bili-comments|bili-comment-|bili-rich-text|bili-text-button|bili-checkbox|bili-icon)/i;
-
+  /** 仅评论宿主强制 open；不再波及全站 bili-icon / checkbox */
   function isCommentShadowHost(el) {
     const name = (el && el.tagName ? el.tagName : "").toLowerCase();
-    return (
-      name === "bili-comments" ||
-      name.startsWith("bili-comment") ||
-      COMMENT_SHADOW_HOST_RE.test(name)
-    );
+    return name === "bili-comments" || name.startsWith("bili-comment");
   }
 
   try {
@@ -1679,30 +1690,59 @@ body.${NS}-video .bpx-player-ctrl-web {
   }
 
   function waitFor(selector, timeout = 15000) {
-    return new Promise((resolve) => {
-      const found = qs(selector);
-      if (found) return resolve(found);
-      const obs = new MutationObserver(() => {
-        const el = qs(selector);
-        if (el) {
+    let obs = null;
+    let timer = 0;
+    let settled = false;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      if (obs) {
+        try {
           obs.disconnect();
-          resolve(el);
-        }
+        } catch (_) {}
+        obs = null;
+      }
+      if (timer) {
+        clearTimeout(timer);
+        timer = 0;
+      }
+      RUNTIME.waiters.delete(cancel);
+    };
+    const cancel = () => cleanup();
+    RUNTIME.waiters.add(cancel);
+
+    const promise = new Promise((resolve) => {
+      const finish = (el) => {
+        cleanup();
+        resolve(el);
+      };
+      const found = qs(selector);
+      if (found) {
+        finish(found);
+        return;
+      }
+      obs = new MutationObserver(() => {
+        const el = qs(selector);
+        if (el) finish(el);
       });
       obs.observe(document.documentElement, { childList: true, subtree: true });
-      setTimeout(() => {
-        obs.disconnect();
-        resolve(qs(selector));
-      }, timeout);
+      timer = setTimeout(() => finish(qs(selector)), timeout);
     });
+    promise.cancel = cancel;
+    return promise;
   }
 
-  function pathOf(url) {
-    try {
-      return new URL(url || location.href).pathname;
-    } catch {
-      return location.pathname;
-    }
+  function cancelAllWaiters() {
+    [...RUNTIME.waiters].forEach((fn) => {
+      try {
+        fn();
+      } catch (_) {}
+    });
+    RUNTIME.waiters.clear();
+  }
+
+  function routeKey() {
+    return `${location.hostname || ""}|${location.pathname || "/"}`;
   }
 
   /**
@@ -1799,12 +1839,21 @@ body.${NS}-video .bpx-player-ctrl-web {
 
   function loadFonts() {
     if (document.getElementById(`${NS}-fonts`)) return;
-    const link = document.createElement("link");
-    link.id = `${NS}-fonts`;
-    link.rel = "stylesheet";
-    link.href =
-      "https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap";
-    (document.head || document.documentElement).appendChild(link);
+    const inject = () => {
+      if (document.getElementById(`${NS}-fonts`)) return;
+      const link = document.createElement("link");
+      link.id = `${NS}-fonts`;
+      link.rel = "stylesheet";
+      link.href =
+        "https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap";
+      (document.head || document.documentElement).appendChild(link);
+    };
+    // 字体不挡首屏；空闲再拉
+    if (typeof requestIdleCallback === "function") {
+      requestIdleCallback(inject, { timeout: 4000 });
+    } else {
+      setTimeout(inject, 1500);
+    }
   }
 
   function ensureStyle() {
@@ -1813,9 +1862,11 @@ body.${NS}-video .bpx-player-ctrl-web {
       style = document.createElement("style");
       style.id = `${NS}-style`;
       (document.head || document.documentElement).appendChild(style);
+      RUNTIME.styleReady = false;
     }
-    if (style.textContent !== CSS) {
+    if (!RUNTIME.styleReady) {
       style.textContent = CSS;
+      RUNTIME.styleReady = true;
     }
   }
 
@@ -1823,6 +1874,7 @@ body.${NS}-video .bpx-player-ctrl-web {
   // 对齐 Evolved：只往评论相关 open shadowRoot 注入
   function injectCommentShadowStyle(shadowRoot) {
     if (!shadowRoot || STATE.route !== "video") return;
+    if (RUNTIME.patchedShadows.has(shadowRoot)) return;
     const id = `${NS}-comment-shadow`;
     let style = shadowRoot.getElementById
       ? shadowRoot.getElementById(id)
@@ -1832,24 +1884,29 @@ body.${NS}-video .bpx-player-ctrl-web {
       style.id = id;
       shadowRoot.appendChild(style);
     }
-    if (style.textContent !== COMMENT_SHADOW_CSS) {
+    if (!style.textContent) {
       style.textContent = COMMENT_SHADOW_CSS;
     }
+    RUNTIME.patchedShadows.add(shadowRoot);
   }
 
   function walkShadowRoots(root, visit) {
     if (!root || !root.querySelectorAll) return;
-    root.querySelectorAll("*").forEach((el) => {
-      if (el.shadowRoot) {
-        visit(el.shadowRoot);
-        walkShadowRoots(el.shadowRoot, visit);
-      }
-    });
+    // 只扫自定义元素（带连字符），大幅减少节点检查
+    const nodes = root.querySelectorAll("*");
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      const rootShadow = el.shadowRoot;
+      if (!rootShadow) continue;
+      const name = el.localName || "";
+      if (name.indexOf("-") === -1) continue;
+      visit(rootShadow);
+      walkShadowRoots(rootShadow, visit);
+    }
   }
 
   function patchAllCommentShadows() {
     if (STATE.route !== "video" || !document.body) return;
-    // 只扫评论根，不再全页 walk
     qsa(CONFIG.commentRoots).forEach((host) => {
       if (host.shadowRoot) {
         injectCommentShadowStyle(host.shadowRoot);
@@ -1862,6 +1919,8 @@ body.${NS}-video .bpx-player-ctrl-web {
   function watchCommentShadows() {
     watchUntil("commentShadow", {
       route: "video",
+      debounce: 500,
+      retries: CONFIG.commentRetries,
       run: patchAllCommentShadows,
       root: () =>
         qs("bili-comments") ||
@@ -1884,7 +1943,10 @@ body.${NS}-video .bpx-player-ctrl-web {
   }
 
   function formatCount(n) {
-    const num = Number(n) || 0;
+    if (n == null || n === "") return "0";
+    if (typeof n === "string" && /[万亿]/.test(n)) return n;
+    const num = Number(n);
+    if (!Number.isFinite(num)) return String(n);
     if (num >= 10000) return (num / 10000).toFixed(num >= 100000 ? 0 : 1) + "万";
     return String(num);
   }
@@ -1892,41 +1954,54 @@ body.${NS}-video .bpx-player-ctrl-web {
   // ---------------------------------------------------------------------------
   // Search: kill history / hot / related + default keyword placeholder
   // ---------------------------------------------------------------------------
+  function clearPlaceholderLocks() {
+    RUNTIME.placeholderObs.forEach((obs) => {
+      try {
+        obs.disconnect();
+      } catch (_) {}
+    });
+    RUNTIME.placeholderObs = [];
+    qsa("[data-bx-placeholder-lock='1']").forEach((el) => {
+      el.removeAttribute("data-bx-placeholder-lock");
+    });
+  }
+
   function sanitizeSearch() {
-    const input = qs(".nav-search-input, input#nav-searchform, #nav-searchform input");
+    if (STATE.route !== "home") return;
+    const input =
+      qs(`#${NS}-search-host .nav-search-input`) ||
+      qs(`#${NS}-search-host input`) ||
+      qs(".nav-search-input, #nav-searchform input");
     if (input) {
       input.setAttribute("placeholder", "搜索");
       input.removeAttribute("data-default");
-      // stop site from writing hot words into placeholder
       if (!input.dataset.bxPlaceholderLock) {
         input.dataset.bxPlaceholderLock = "1";
         const lock = () => {
-          if (input.placeholder && input.placeholder !== "搜索") {
+          if (input.isConnected && input.placeholder !== "搜索") {
             input.placeholder = "搜索";
           }
         };
         const obs = new MutationObserver(lock);
         obs.observe(input, { attributes: true, attributeFilter: ["placeholder"] });
-        setInterval(lock, 1500);
+        RUNTIME.placeholderObs.push(obs);
+        lock();
       }
     }
 
-    // remove panels if they get injected despite CSS
-    qsa(
-      [
-        ".search-panel",
-        ".nav-search-panel",
-        ".header-search-suggest",
-        ".search-panel-container",
-        ".suggest-wrap",
-        "[class*='search-panel']",
-      ].join(",")
-    ).forEach((el) => {
-      if (el && document.body.classList.contains(`${NS}-home`)) {
+    const root =
+      document.getElementById(`${NS}-search-host`) ||
+      qs(".bili-header") ||
+      document.body;
+    if (!root || !root.querySelectorAll) return;
+    root
+      .querySelectorAll(
+        ".search-panel, .nav-search-panel, .header-search-suggest, .suggest-wrap"
+      )
+      .forEach((el) => {
         el.style.setProperty("display", "none", "important");
         el.setAttribute("hidden", "true");
-      }
-    });
+      });
   }
 
   // ---------------------------------------------------------------------------
@@ -2089,6 +2164,7 @@ body.${NS}-video .bpx-player-ctrl-web {
     if (STATE.dynLoading) return;
     if (!reset && !STATE.dynHasMore) return;
 
+    const gen = RUNTIME.dynGen;
     STATE.dynLoading = true;
     setDynStatus(reset ? "加载关注动态…" : "加载更多…");
 
@@ -2113,12 +2189,12 @@ body.${NS}-video .bpx-player-ctrl-web {
 
     try {
       const json = await apiGet(url);
+      if (gen !== RUNTIME.dynGen || STATE.route !== "home") return;
       if (!json || json.code !== 0) {
         const msg =
           (json && (json.message || json.msg)) ||
           "无法获取动态（请确认已登录）";
         setDynStatus(msg);
-        STATE.dynLoading = false;
         return;
       }
 
@@ -2130,27 +2206,33 @@ body.${NS}-video .bpx-player-ctrl-web {
       STATE.dynOffset = data.offset || "";
       STATE.dynHasMore = !!data.has_more;
 
-      if (!document.getElementById(`${NS}-dyn-grid`).children.length) {
+      const grid = document.getElementById(`${NS}-dyn-grid`);
+      if (!grid || !grid.children.length) {
         setDynStatus("暂无关注视频动态");
       } else {
         setDynStatus(STATE.dynHasMore ? "继续下滑加载更多" : "没有更多了");
       }
     } catch (e) {
+      if (gen !== RUNTIME.dynGen || STATE.route !== "home") return;
       console.error("[BilibiliX] dyn feed", e);
       setDynStatus("动态加载失败，请刷新重试");
     } finally {
-      STATE.dynLoading = false;
+      if (gen === RUNTIME.dynGen) STATE.dynLoading = false;
     }
   }
 
   function onDynScroll() {
     if (STATE.route !== "home") return;
-    const status = document.getElementById(`${NS}-dyn-status`);
-    if (!status) return;
-    const rect = status.getBoundingClientRect();
-    if (rect.top < window.innerHeight + 240) {
-      loadDynPage(false);
-    }
+    if (RUNTIME.dynScrollTick) return;
+    RUNTIME.dynScrollTick = requestAnimationFrame(() => {
+      RUNTIME.dynScrollTick = 0;
+      const status = document.getElementById(`${NS}-dyn-status`);
+      if (!status) return;
+      const rect = status.getBoundingClientRect();
+      if (rect.top < window.innerHeight + 240) {
+        loadDynPage(false);
+      }
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -2178,11 +2260,15 @@ body.${NS}-video .bpx-player-ctrl-web {
 
     host.style.setProperty("position", "fixed", "important");
     host.style.setProperty("left", "50%", "important");
+    host.style.setProperty("transform", "translateX(-50%)", "important");
     host.style.setProperty("z-index", "2147483000", "important");
     host.style.setProperty("pointer-events", "none", "important");
     host.style.setProperty("margin", "0", "important");
     host.style.setProperty("right", "auto", "important");
     host.style.setProperty("bottom", "auto", "important");
+    RUNTIME.searchHostEl = host;
+    RUNTIME.searchBackdropEl = backdrop;
+    RUNTIME.searchHintEl = document.getElementById(`${NS}-home-hint`);
 
     const wrap = qs(".center-search-container");
     const form = qs("#nav-searchform");
@@ -2219,13 +2305,21 @@ body.${NS}-video .bpx-player-ctrl-web {
   }
 
   function applyHomeScrollVisual(p) {
-    const host = document.getElementById(`${NS}-search-host`);
-    const backdrop = document.getElementById(`${NS}-search-backdrop`);
-    const hint = document.getElementById(`${NS}-home-hint`);
+    const key = (p * 80) | 0;
+    if (key === RUNTIME.lastScrollVisualKey && p > 0 && p < 1) return;
+    RUNTIME.lastScrollVisualKey = key;
+
+    const host =
+      RUNTIME.searchHostEl || document.getElementById(`${NS}-search-host`);
     if (!host) return;
+    RUNTIME.searchHostEl = host;
+    const backdrop =
+      RUNTIME.searchBackdropEl ||
+      document.getElementById(`${NS}-search-backdrop`);
+    const hint =
+      RUNTIME.searchHintEl || document.getElementById(`${NS}-home-hint`);
 
     const e = 1 - Math.pow(1 - p, 2.4);
-    // 吸顶后按顶栏高度垂直居中
     const dockTopPx = Math.max(0, (CONFIG.homeBarH - CONFIG.homeSearchH) / 2);
     const heroTopPx = window.innerHeight * 0.42;
     const topPx = lerp(heroTopPx, dockTopPx, e);
@@ -2237,18 +2331,16 @@ body.${NS}-video .bpx-player-ctrl-web {
 
     host.style.setProperty("top", `${topPx}px`, "important");
     host.style.setProperty("width", `${widthPx}px`, "important");
-    host.style.setProperty("transform", "translateX(-50%)", "important");
-    host.style.setProperty("position", "fixed", "important");
 
+    // 模糊走 CSS .bx-show，避免每帧写 backdrop-filter
     if (backdrop) {
-      const show = p > 0.45;
-      backdrop.style.background = show ? "rgba(14,16,20,0.9)" : "rgba(14,16,20,0)";
-      backdrop.style.borderBottomColor = show ? "rgba(255,255,255,0.08)" : "transparent";
-      backdrop.style.backdropFilter = show ? "blur(12px)" : "blur(0px)";
-      backdrop.classList.toggle(`${NS}-show`, show);
+      RUNTIME.searchBackdropEl = backdrop;
+      backdrop.classList.toggle(`${NS}-show`, p > 0.45);
     }
     if (hint) {
-      hint.style.opacity = String(Math.max(0, 1 - p * 1.35));
+      RUNTIME.searchHintEl = hint;
+      const op = String(Math.max(0, 1 - p * 1.35));
+      if (hint.style.opacity !== op) hint.style.opacity = op;
       hint.style.animation = p > 0.15 ? "none" : "";
     }
 
@@ -2264,18 +2356,19 @@ body.${NS}-video .bpx-player-ctrl-web {
     }
     const range = Math.max(280, window.innerHeight * 0.75);
     STATE.scrollTarget = Math.min(1, Math.max(0, window.scrollY / range));
-    // smooth follow — prevents one-wheel jump from 0 → 1
     STATE.scrollP += (STATE.scrollTarget - STATE.scrollP) * 0.14;
-    if (Math.abs(STATE.scrollTarget - STATE.scrollP) < 0.001) {
-      STATE.scrollP = STATE.scrollTarget;
-    }
+    const settled = Math.abs(STATE.scrollTarget - STATE.scrollP) < 0.001;
+    if (settled) STATE.scrollP = STATE.scrollTarget;
     applyHomeScrollVisual(STATE.scrollP);
-    onDynScroll();
-    STATE.rafHome = requestAnimationFrame(tickHomeScroll);
+    if (!settled) {
+      STATE.rafHome = requestAnimationFrame(tickHomeScroll);
+    } else {
+      STATE.rafHome = 0;
+    }
   }
 
   function startHomeScrollLoop() {
-    if (STATE.rafHome) cancelAnimationFrame(STATE.rafHome);
+    if (STATE.rafHome) return;
     STATE.rafHome = requestAnimationFrame(tickHomeScroll);
   }
 
@@ -2284,6 +2377,7 @@ body.${NS}-video .bpx-player-ctrl-web {
     STATE.rafHome = 0;
     STATE.scrollP = 0;
     STATE.scrollTarget = 0;
+    RUNTIME.lastScrollVisualKey = -1;
   }
 
   function updateHomeScrollProgress() {
@@ -2292,8 +2386,11 @@ body.${NS}-video .bpx-player-ctrl-web {
   }
 
   function teardownSearchChrome() {
-    const host = document.getElementById(`${NS}-search-host`);
-    const backdrop = document.getElementById(`${NS}-search-backdrop`);
+    const host =
+      RUNTIME.searchHostEl || document.getElementById(`${NS}-search-host`);
+    const backdrop =
+      RUNTIME.searchBackdropEl ||
+      document.getElementById(`${NS}-search-backdrop`);
     if (host) {
       const form = host.querySelector("#nav-searchform, .center-search-container");
       const slot = qs(".bili-header__bar") || qs(".bili-header");
@@ -2303,17 +2400,49 @@ body.${NS}-video .bpx-player-ctrl-web {
       host.remove();
     }
     if (backdrop) backdrop.remove();
+    RUNTIME.searchHostEl = null;
+    RUNTIME.searchBackdropEl = null;
+    RUNTIME.searchHintEl = null;
     qsa('[data-bx-dup="1"]').forEach((el) => {
       el.style.removeProperty("display");
       el.removeAttribute("data-bx-dup");
     });
   }
+  function bindHomeListeners() {
+    const onScroll = () => {
+      updateHomeScrollProgress();
+      startHomeScrollLoop();
+      onDynScroll();
+    };
+    if (RUNTIME.homeScroll) {
+      window.removeEventListener("scroll", RUNTIME.homeScroll);
+    }
+    if (RUNTIME.homeResize) {
+      window.removeEventListener("resize", RUNTIME.homeResize);
+    }
+    RUNTIME.homeScroll = onScroll;
+    RUNTIME.homeResize = onScroll;
+    window.addEventListener("scroll", RUNTIME.homeScroll, { passive: true });
+    window.addEventListener("resize", RUNTIME.homeResize, { passive: true });
+    watchUntil("homeSearch", {
+      route: "home",
+      debounce: 400,
+      run: () => {
+        sanitizeSearch();
+        ensureSearchChrome();
+      },
+      root: () =>
+        document.getElementById(`${NS}-search-host`) ||
+        qs(".bili-header") ||
+        document.body,
+    });
+  }
+
   function setupHome() {
     setBodyRoute("home");
     document.body.classList.add(`${NS}-home-hero`);
     ensureStyle();
 
-    // already mounted with new list cards — just keep chrome alive
     const existingGrid = document.getElementById(`${NS}-dyn-grid`);
     if (
       existingGrid &&
@@ -2322,7 +2451,9 @@ body.${NS}-video .bpx-player-ctrl-web {
     ) {
       ensureSearchChrome();
       sanitizeSearch();
+      bindHomeListeners();
       startHomeScrollLoop();
+      clearBooting();
       return;
     }
 
@@ -2333,7 +2464,6 @@ body.${NS}-video .bpx-player-ctrl-web {
       hero = document.createElement("div");
       hero.id = `${NS}-home-hero`;
       hero.innerHTML = `<div id="${NS}-home-hint">向下滑动 · 关注动态</div>`;
-      // attach to body so site feed wrappers can't collapse / whiten our layout
       document.body.insertBefore(hero, document.body.firstChild);
     } else {
       const hint = document.getElementById(`${NS}-home-hint`);
@@ -2354,40 +2484,17 @@ body.${NS}-video .bpx-player-ctrl-web {
 
     sanitizeSearch();
     ensureSearchChrome();
-    ensureStyle();
+    bindHomeListeners();
     startHomeScrollLoop();
-
-    // always rebuild list cards (inline styles) so old 5-col DOM cannot linger
     loadDynPage(true);
-
-    const onScroll = () => {
-      updateHomeScrollProgress();
-      sanitizeSearch();
-      ensureSearchChrome();
-    };
-
-    if (RUNTIME.homeScroll) {
-      window.removeEventListener("scroll", RUNTIME.homeScroll);
-    }
-    if (RUNTIME.homeResize) {
-      window.removeEventListener("resize", RUNTIME.homeResize);
-    }
-    RUNTIME.homeScroll = onScroll;
-    RUNTIME.homeResize = onScroll;
-    window.addEventListener("scroll", RUNTIME.homeScroll, { passive: true });
-    window.addEventListener("resize", RUNTIME.homeResize, { passive: true });
-    onScroll();
-
-    watchUntil("homeSearch", {
-      route: "home",
-      run: () => {
-        sanitizeSearch();
-        ensureSearchChrome();
-      },
-    });
+    updateHomeScrollProgress();
+    startHomeScrollLoop();
+    clearBooting();
   }
 
   function teardownHome() {
+    RUNTIME.dynGen += 1;
+    STATE.dynLoading = false;
     if (RUNTIME.homeScroll) {
       window.removeEventListener("scroll", RUNTIME.homeScroll);
       RUNTIME.homeScroll = null;
@@ -2396,8 +2503,13 @@ body.${NS}-video .bpx-player-ctrl-web {
       window.removeEventListener("resize", RUNTIME.homeResize);
       RUNTIME.homeResize = null;
     }
+    if (RUNTIME.dynScrollTick) {
+      cancelAnimationFrame(RUNTIME.dynScrollTick);
+      RUNTIME.dynScrollTick = 0;
+    }
     stopHomeScrollLoop();
     stopWatch("homeSearch");
+    clearPlaceholderLocks();
     teardownSearchChrome();
     const hero = document.getElementById(`${NS}-home-hero`);
     const feed = document.getElementById(`${NS}-dyn-feed`);
@@ -2449,6 +2561,19 @@ body.${NS}-video .bpx-player-ctrl-web {
   function integrateDanmakuSendbar() {
     if (STATE.route !== "video") return false;
 
+    // 输入条与左侧弹幕控件都挂好后跳过重活
+    const existingSend = document.getElementById(`${NS}-dm-send-host`);
+    const existingCtrl = document.getElementById(`${NS}-dm-ctrl-host`);
+    if (
+      existingSend &&
+      existingSend.isConnected &&
+      existingSend.querySelector("input, textarea") &&
+      existingCtrl &&
+      existingCtrl.isConnected
+    ) {
+      return true;
+    }
+
     const sendingArea = qs(".bpx-player-sending-area");
     const controlLeft = qs(".bpx-player-control-bottom-left");
     const controlCenter = qs(".bpx-player-control-bottom-center");
@@ -2494,7 +2619,16 @@ body.${NS}-video .bpx-player-ctrl-web {
       sendHost.id = `${NS}-dm-send-host`;
     }
     if (!controlCenter.contains(sendHost)) {
-      controlCenter.innerHTML = "";
+      let stash = document.getElementById(`${NS}-center-stash`);
+      if (!stash) {
+        stash = document.createElement("div");
+        stash.id = `${NS}-center-stash`;
+        stash.hidden = true;
+        while (controlCenter.firstChild) {
+          stash.appendChild(controlCenter.firstChild);
+        }
+        sendingArea.appendChild(stash);
+      }
       controlCenter.appendChild(sendHost);
     }
 
@@ -2563,6 +2697,8 @@ body.${NS}-video .bpx-player-ctrl-web {
       qs(".bpx-player-sending-area");
     const sendHost = document.getElementById(`${NS}-dm-send-host`);
     const ctrlHost = document.getElementById(`${NS}-dm-ctrl-host`);
+    const controlCenter = qs(".bpx-player-control-bottom-center");
+    const stash = document.getElementById(`${NS}-center-stash`);
     if (area) {
       if (ctrlHost) {
         while (ctrlHost.firstChild) area.appendChild(ctrlHost.firstChild);
@@ -2575,36 +2711,37 @@ body.${NS}-video .bpx-player-ctrl-web {
     }
     if (sendHost) sendHost.remove();
     if (ctrlHost) ctrlHost.remove();
+    if (stash && controlCenter) {
+      while (stash.firstChild) controlCenter.appendChild(stash.firstChild);
+      stash.remove();
+    }
   }
 
-  async function tryAutoplay() {
+  async function tryAutoplay(gen) {
     if (STATE.autoplayTried) return;
     STATE.autoplayTried = true;
 
-    const tryPlayMedia = async () => {
-      const media =
-        qs("#bilibili-player video") ||
-        qs(".bpx-player-video-wrap video") ||
-        qs("bwp-video");
-      if (!media) return false;
+    const stillVideo = () =>
+      STATE.route === "video" && (gen == null || gen === RUNTIME.videoGen);
+
+    const getMedia = () =>
+      qs("#bilibili-player video") ||
+      qs(".bpx-player-video-wrap video") ||
+      qs("bwp-video");
+
+    // 绝不靠「静音自动播放」开播——那会把用户留在静音状态
+    const ensureUnmuted = (media) => {
+      if (!media) return;
       try {
         media.muted = false;
-        const p = media.play();
-        if (p && typeof p.then === "function") await p;
-        return !media.paused;
-      } catch {
-        try {
-          media.muted = true;
-          const p = media.play();
-          if (p && typeof p.then === "function") await p;
-          return !media.paused;
-        } catch {
-          return false;
+        if (typeof media.volume === "number" && media.volume === 0) {
+          media.volume = 1;
         }
-      }
+      } catch (_) {}
     };
 
     const clickPlay = () => {
+      if (!stillVideo()) return;
       const btn =
         qs(".bpx-player-ctrl-play") ||
         qs(".bpx-player-dm-btn-play") ||
@@ -2614,26 +2751,43 @@ body.${NS}-video .bpx-player-ctrl-web {
     };
 
     await waitFor("#bilibili-player, .bpx-player-container", 12000);
+    if (!stillVideo()) return;
     await waitFor(
       "#bilibili-player video, .bpx-player-video-wrap video, bwp-video",
       12000
     );
+    if (!stillVideo()) return;
 
     clickPlay();
-    const ok = await tryPlayMedia();
-    if (!ok) {
-      setTimeout(async () => {
+    const media = getMedia();
+    ensureUnmuted(media);
+    if (media) {
+      try {
+        const p = media.play();
+        if (p && typeof p.then === "function") await p;
+      } catch (_) {
+        // 浏览器拦截带声自动播放时保持暂停，等用户点击；不要改成静音开播
+      }
+      ensureUnmuted(media);
+    }
+
+    if (stillVideo() && media && media.paused) {
+      setTimeout(() => {
+        if (!stillVideo()) return;
         clickPlay();
-        await tryPlayMedia();
+        ensureUnmuted(getMedia());
       }, 800);
     }
   }
 
   function enableVideoDarkMode() {
-    // 对齐 Bilibili-Evolved：挂 body.dark，并尽量打开官方 theme_style
     document.documentElement.classList.add("dark");
     document.body.classList.add("dark", "integrated-dark");
     document.documentElement.setAttribute("lab-style", "dark");
+    if (RUNTIME.prevColorScheme === "" && !document.documentElement.dataset.bxSchemeSaved) {
+      RUNTIME.prevColorScheme = document.documentElement.style.colorScheme || "";
+      document.documentElement.dataset.bxSchemeSaved = "1";
+    }
     document.documentElement.style.colorScheme = "dark";
 
     try {
@@ -2656,7 +2810,11 @@ body.${NS}-video .bpx-player-ctrl-web {
     if (!schemeMeta) {
       schemeMeta = document.createElement("meta");
       schemeMeta.name = "color-scheme";
+      schemeMeta.dataset.bxOwned = "1";
       document.head.appendChild(schemeMeta);
+    }
+    if (!schemeMeta.dataset.bxPrev) {
+      schemeMeta.dataset.bxPrev = schemeMeta.content || "";
     }
     schemeMeta.content = "dark";
   }
@@ -2667,10 +2825,32 @@ body.${NS}-video .bpx-player-ctrl-web {
     if (document.documentElement.getAttribute("lab-style") === "dark") {
       document.documentElement.removeAttribute("lab-style");
     }
-    // 不强制清 cookie，避免影响用户在 B 站其它页的深色偏好
+    if (document.documentElement.dataset.bxSchemeSaved) {
+      document.documentElement.style.colorScheme = RUNTIME.prevColorScheme || "";
+      if (!RUNTIME.prevColorScheme) {
+        document.documentElement.style.removeProperty("color-scheme");
+      }
+      delete document.documentElement.dataset.bxSchemeSaved;
+      RUNTIME.prevColorScheme = "";
+    }
+    const themeMeta = document.querySelector('meta[name="theme-color"]');
+    if (themeMeta && themeMeta.dataset.bxLight != null) {
+      themeMeta.content = themeMeta.dataset.bxLight;
+      delete themeMeta.dataset.bxLight;
+    }
+    const schemeMeta = document.querySelector('meta[name="color-scheme"]');
+    if (schemeMeta) {
+      if (schemeMeta.dataset.bxOwned === "1") {
+        schemeMeta.remove();
+      } else if (schemeMeta.dataset.bxPrev != null) {
+        schemeMeta.content = schemeMeta.dataset.bxPrev;
+        delete schemeMeta.dataset.bxPrev;
+      }
+    }
   }
 
   async function setupVideo() {
+    const gen = ++RUNTIME.videoGen;
     setBodyRoute("video");
     STATE.autoplayTried = false;
     ensureStyle();
@@ -2680,14 +2860,18 @@ body.${NS}-video .bpx-player-ctrl-web {
       "#bilibili-player, #playerWrap, .player-wrap, .bpx-player-container",
       15000
     );
+    if (gen !== RUNTIME.videoGen || STATE.route !== "video") return;
 
     syncPlayerHeightRecord();
     watchDanmakuSendbar();
     watchCommentShadows();
-    tryAutoplay();
+    tryAutoplay(gen);
+    clearBooting();
   }
 
   function teardownVideo() {
+    RUNTIME.videoGen += 1;
+    cancelAllWaiters();
     if (RUNTIME.playerRO) {
       try {
         RUNTIME.playerRO.disconnect();
@@ -2706,39 +2890,54 @@ body.${NS}-video .bpx-player-ctrl-web {
   function applyRoute() {
     if (!document.body) return;
     const route = detectRoute();
+    const key = routeKey();
+    // 忽略仅 query/hash 变化（进度 t=、分 P 用 replaceState 等），避免重复 setup
+    if (key === RUNTIME.lastRouteKey && route === STATE.route) return;
+    RUNTIME.lastRouteKey = key;
 
     if (route === "home") {
       teardownVideo();
       setupHome();
     } else if (route === "video") {
       teardownHome();
+      teardownVideo();
       setupVideo();
     } else if (route === "search") {
       teardownHome();
       teardownVideo();
       setBodyRoute("search");
+      clearBooting();
     } else {
       teardownHome();
       teardownVideo();
       setBodyRoute("other");
+      clearBooting();
     }
+    if (STATE.anonMode) syncAnonTitle();
   }
 
   function watchSpa() {
-    let last = location.href;
+    if (RUNTIME.spaHooked) return;
+    RUNTIME.spaHooked = true;
+    let lastKey = routeKey();
     const tick = () => {
-      if (location.href !== last) {
-        last = location.href;
+      if (document.hidden) return;
+      const key = routeKey();
+      if (key !== lastKey) {
+        lastKey = key;
         applyRoute();
       }
     };
+    RUNTIME.spaTick = tick;
     const wrap = (type) => {
       const raw = history[type];
+      if (raw[`${NS}Patched`]) return;
       history[type] = function () {
         const ret = raw.apply(this, arguments);
         window.dispatchEvent(new Event(`${NS}-nav`));
         return ret;
       };
+      history[type][`${NS}Patched`] = true;
     };
     wrap("pushState");
     wrap("replaceState");
@@ -2746,8 +2945,20 @@ body.${NS}-video .bpx-player-ctrl-web {
       window.dispatchEvent(new Event(`${NS}-nav`))
     );
     window.addEventListener(`${NS}-nav`, () => setTimeout(applyRoute, 50));
-    // 事件为主；低频轮询仅兜底（站点偶发不走 history API）
-    setInterval(tick, CONFIG.spaPollMs);
+    const startPoll = () => {
+      if (RUNTIME.spaPollTimer || document.hidden) return;
+      RUNTIME.spaPollTimer = setInterval(tick, CONFIG.spaPollMs);
+    };
+    const stopPoll = () => {
+      if (!RUNTIME.spaPollTimer) return;
+      clearInterval(RUNTIME.spaPollTimer);
+      RUNTIME.spaPollTimer = 0;
+    };
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) stopPoll();
+      else startPoll();
+    });
+    startPoll();
   }
 
   // ---------------------------------------------------------------------------
@@ -2759,13 +2970,12 @@ body.${NS}-video .bpx-player-ctrl-web {
     STATE.route = BOOT_ROUTE;
   }
 
-  // 完整 CSS 就绪后，body 一出现就揭开（不必干等 DOMContentLoaded）
-  function armEarlyReveal() {
+  // body 一出现先盖路由类；揭开遮罩放到 setup 完成 / boot 末尾
+  function armEarlyStamp() {
     if (BOOT_ROUTE === "other") return;
     const go = () => {
       if (!document.body) return false;
       stampRouteClasses(BOOT_ROUTE);
-      clearBooting();
       return true;
     };
     if (go()) return;
@@ -2774,7 +2984,7 @@ body.${NS}-video .bpx-player-ctrl-web {
     });
     mo.observe(document.documentElement, { childList: true });
   }
-  armEarlyReveal();
+  armEarlyStamp();
 
   function boot() {
     ensureStyle();
@@ -2785,10 +2995,10 @@ body.${NS}-video .bpx-player-ctrl-web {
     syncAnonTitle();
     applyRoute();
     watchSpa();
+    // setup 内也会 clear；这里兜底（other/search 或 setup 同步返回）
     clearBooting();
   }
 
-  // 极端情况（脚本中途异常）避免页面一直不可见
   setTimeout(() => {
     document.documentElement.classList.remove(`${NS}-booting`);
   }, CONFIG.bootFailsafeMs);
